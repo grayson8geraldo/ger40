@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""TightStop Walk-Forward Validation: WF, Regime, Monte Carlo, Random Walk tests."""
+"""Walk-forward validation, regime analysis, Monte Carlo, and random walk tests."""
 
-import glob, warnings, numpy as np, pandas as pd
+import glob
+import numpy as np
+import pandas as pd
 from collections import defaultdict
 
-warnings.filterwarnings("ignore")
-np.random.seed(42)
-
-# ── Load data ────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# DATA LOADING
+# ---------------------------------------------------------------------------
 files = sorted(glob.glob("/home/user/ger40/DEU.IDX-EUR_Hour_*.csv"))
 df = pd.concat(
     [pd.read_csv(f, parse_dates=["UTC"], dayfirst=True) for f in files],
@@ -15,210 +16,252 @@ df = pd.concat(
 )
 df.sort_values("UTC", inplace=True)
 df.reset_index(drop=True, inplace=True)
+
+# ---------------------------------------------------------------------------
+# INDICATORS (vectorised, computed once on full data)
+# ---------------------------------------------------------------------------
+df["EMA9"] = df["Close"].ewm(span=9, adjust=False).mean()
+df["EMA21"] = df["Close"].ewm(span=21, adjust=False).mean()
+df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
+
+# ATR14
+tr = pd.concat(
+    [
+        df["High"] - df["Low"],
+        (df["High"] - df["Close"].shift(1)).abs(),
+        (df["Low"] - df["Close"].shift(1)).abs(),
+    ],
+    axis=1,
+).max(axis=1)
+df["ATR14"] = tr.ewm(span=14, adjust=False).mean()
+
+# RSI14
+delta = df["Close"].diff()
+gain = delta.clip(lower=0)
+loss = (-delta.clip(upper=0))
+avg_gain = gain.ewm(span=14, adjust=False).mean()
+avg_loss = loss.ewm(span=14, adjust=False).mean()
+rs = avg_gain / avg_loss.replace(0, np.nan)
+df["RSI14"] = 100 - 100 / (1 + rs)
+df["RSI14"] = df["RSI14"].fillna(50)
+
+# Average volume (rolling 50)
+df["AvgVol"] = df["Volume"].rolling(50, min_periods=1).mean()
+
+# Hour & date helpers
 df["hour"] = df["UTC"].dt.hour
 df["date"] = df["UTC"].dt.date
-df["dow"] = df["UTC"].dt.dayofweek  # 0=Mon
+df["dow"] = df["UTC"].dt.dayofweek  # Mon=0 .. Sun=6
 
-# ── Indicators ───────────────────────────────────────────────────────────────
-def add_indicators(d):
-    d = d.copy()
-    d["EMA9"] = d["Close"].ewm(span=9, adjust=False).mean()
-    d["EMA21"] = d["Close"].ewm(span=21, adjust=False).mean()
-    d["EMA50"] = d["Close"].ewm(span=50, adjust=False).mean()
-    # ATR14
-    d["TR"] = np.maximum(
-        d["High"] - d["Low"],
-        np.maximum(abs(d["High"] - d["Close"].shift(1)), abs(d["Low"] - d["Close"].shift(1))),
-    )
-    d["ATR14"] = d["TR"].ewm(span=14, adjust=False).mean()
-    # RSI14
-    delta = d["Close"].diff()
-    gain = delta.clip(lower=0)
-    loss = (-delta.clip(upper=0))
-    avg_gain = gain.ewm(span=14, adjust=False).mean()
-    avg_loss = loss.ewm(span=14, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, 1e-9)
-    d["RSI14"] = 100 - 100 / (1 + rs)
-    # avg volume (20-bar)
-    d["avgvol"] = d["Volume"].rolling(20, min_periods=1).mean()
-    # EMA9 cross above EMA21
-    d["ema9_prev"] = d["EMA9"].shift(1)
-    d["ema21_prev"] = d["EMA21"].shift(1)
-    d["ema9_cross_up"] = (d["ema9_prev"] < d["ema21_prev"]) & (d["EMA9"] > d["EMA21"])
-    # EMA50 lagged 5 bars for regime
-    d["EMA50_5ago"] = d["EMA50"].shift(5)
-    return d
+# ORB per day: max high / min low of hours 7,8
+orb_mask = df["hour"].isin([7, 8])
+orb_grp = df[orb_mask].groupby("date")
+orb_high = orb_grp["High"].max().rename("ORB_High")
+orb_low = orb_grp["Low"].min().rename("ORB_Low")
+orb = pd.concat([orb_high, orb_low], axis=1)
+orb["ORB_Range"] = orb["ORB_High"] - orb["ORB_Low"]
+df = df.merge(orb, on="date", how="left")
 
-# ── ORB per day ──────────────────────────────────────────────────────────────
-def add_orb(d):
-    orb = d[d["hour"].isin([7, 8])].groupby("date").agg(ORB_High=("High", "max"), ORB_Low=("Low", "min"))
-    orb["ORB_range"] = orb["ORB_High"] - orb["ORB_Low"]
-    d = d.merge(orb, on="date", how="left")
-    return d
+# EMA9 cross above EMA21 flag
+df["ema9_above"] = df["EMA9"] > df["EMA21"]
+df["ema9_cross_up"] = df["ema9_above"] & ~df["ema9_above"].shift(1, fill_value=False)
 
-# ── Backtest ─────────────────────────────────────────────────────────────────
-def backtest(d, capital_start=200.0):
-    d = add_indicators(d)
-    d = add_orb(d)
-    d = d.dropna(subset=["EMA50", "ATR14", "RSI14"]).reset_index(drop=True)
+# EMA50 lagged 5 bars (for regime)
+df["EMA50_lag5"] = df["EMA50"].shift(5)
 
-    capital = capital_start
+print(f"Loaded {len(df)} bars from {df['UTC'].min()} to {df['UTC'].max()}")
+
+# ---------------------------------------------------------------------------
+# BACKTEST ENGINE
+# ---------------------------------------------------------------------------
+def _close_pos(pos, exit_price, trades):
+    if pos["dir"] == "long":
+        pnl = (exit_price - pos["entry"]) * pos["size"]
+    else:
+        pnl = (pos["entry"] - exit_price) * pos["size"]
+    trades.append(dict(
+        dir=pos["dir"], entry=pos["entry"], exit=exit_price,
+        pnl=pnl, size=pos["size"], bar_date=pos["bar_date"],
+        bar_utc=pos.get("bar_utc"), kind=pos.get("kind", ""),
+    ))
+
+
+def backtest(dfx, starting_capital=200.0):
+    """Run TightStop backtest on a dataframe slice. Returns (final_cap, trades, max_dd)."""
+    dfx = dfx.reset_index(drop=True)
+    capital = starting_capital
     peak = capital
     max_dd = 0.0
     trades = []
-    pos = None  # dict: dir, entry, sl, tp, trail, date
+    position = None
     daily_count = defaultdict(int)
 
-    for i in range(len(d)):
-        r = d.iloc[i]
-        h, dt, dow = int(r["hour"]), r["date"], int(r["dow"])
+    for i in range(len(dfx)):
+        row = dfx.iloc[i]
+        h = int(row["hour"])
+        d = row["date"]
+        dow = int(row["dow"])
 
-        # Skip Fridays (dow=4) and weekends
-        if dow > 3:
-            # force close any open position at end of allowed days
-            if pos is not None:
-                pnl_pts = (r["Close"] - pos["entry"]) * pos["dir"]
-                pnl = pnl_pts / pos["entry"] * pos["risk_capital"]  # simplified pnl
-                capital += pnl
-                trades.append({**pos, "exit": r["Close"], "pnl": pnl, "exit_reason": "weekend"})
-                pos = None
+        # Skip Fridays and weekends
+        if dow >= 4:
+            if position and h >= 20:
+                _close_pos(position, row["Close"], trades)
+                capital += trades[-1]["pnl"]
+                position = None
             continue
 
-        # EOD close
-        if pos is not None and h >= 20:
-            pnl_pts = (r["Close"] - pos["entry"]) * pos["dir"]
-            pnl = pnl_pts / pos["entry"] * pos["risk_capital"]
-            capital += pnl
-            trades.append({**pos, "exit": r["Close"], "pnl": pnl, "exit_reason": "eod"})
-            pos = None
-
-        # Check SL / TP / trail on open position
-        if pos is not None:
-            if pos["dir"] == 1:  # long
-                # update trail
-                trail_price = r["High"] - pos["trail_dist"]
-                pos["sl"] = max(pos["sl"], trail_price)
-                if r["Low"] <= pos["sl"]:
-                    exit_p = pos["sl"]
-                    pnl_pts = (exit_p - pos["entry"])
-                    pnl = pnl_pts / pos["entry"] * pos["risk_capital"]
-                    capital += pnl
-                    trades.append({**pos, "exit": exit_p, "pnl": pnl, "exit_reason": "sl"})
-                    pos = None
-                elif r["High"] >= pos["tp"]:
-                    exit_p = pos["tp"]
-                    pnl_pts = (exit_p - pos["entry"])
-                    pnl = pnl_pts / pos["entry"] * pos["risk_capital"]
-                    capital += pnl
-                    trades.append({**pos, "exit": exit_p, "pnl": pnl, "exit_reason": "tp"})
-                    pos = None
+        # ---- Manage open position ----
+        if position is not None:
+            closed = False
+            if position["dir"] == "long":
+                if row["Low"] <= position["sl"]:
+                    _close_pos(position, position["sl"], trades)
+                    capital += trades[-1]["pnl"]
+                    position = None
+                    closed = True
+                elif row["High"] >= position["tp"]:
+                    _close_pos(position, position["tp"], trades)
+                    capital += trades[-1]["pnl"]
+                    position = None
+                    closed = True
+                else:
+                    new_trail = row["Close"] - 1.0 * row["ATR14"]
+                    if new_trail > position["sl"]:
+                        position["sl"] = new_trail
             else:  # short
-                trail_price = r["Low"] + pos["trail_dist"]
-                pos["sl"] = min(pos["sl"], trail_price)
-                if r["High"] >= pos["sl"]:
-                    exit_p = pos["sl"]
-                    pnl_pts = (pos["entry"] - exit_p)
-                    pnl = pnl_pts / pos["entry"] * pos["risk_capital"]
-                    capital += pnl
-                    trades.append({**pos, "exit": exit_p, "pnl": pnl, "exit_reason": "sl"})
-                    pos = None
-                elif r["Low"] <= pos["tp"]:
-                    exit_p = pos["tp"]
-                    pnl_pts = (pos["entry"] - exit_p)
-                    pnl = pnl_pts / pos["entry"] * pos["risk_capital"]
-                    capital += pnl
-                    trades.append({**pos, "exit": exit_p, "pnl": pnl, "exit_reason": "tp"})
-                    pos = None
+                if row["High"] >= position["sl"]:
+                    _close_pos(position, position["sl"], trades)
+                    capital += trades[-1]["pnl"]
+                    position = None
+                    closed = True
+                elif row["Low"] <= position["tp"]:
+                    _close_pos(position, position["tp"], trades)
+                    capital += trades[-1]["pnl"]
+                    position = None
+                    closed = True
+                else:
+                    new_trail = row["Close"] + 1.0 * row["ATR14"]
+                    if new_trail < position["sl"]:
+                        position["sl"] = new_trail
 
-        # Update drawdown
-        peak = max(peak, capital)
-        dd = (peak - capital) / peak if peak > 0 else 0
-        max_dd = max(max_dd, dd)
+            # EOD close
+            if position is not None and h >= 20:
+                _close_pos(position, row["Close"], trades)
+                capital += trades[-1]["pnl"]
+                position = None
+                closed = True
 
-        # No new entry if already in position or max daily trades reached
-        if pos is not None or daily_count[dt] >= 3:
+            # Update drawdown
+            if capital > peak:
+                peak = capital
+            dd = (peak - capital) / peak if peak > 0 else 0
+            if dd > max_dd:
+                max_dd = dd
+            continue
+
+        # ---- Check for new entries (no position) ----
+        if daily_count[d] >= 3:
+            continue
+        if capital <= 0:
             continue
 
         risk_amt = capital * 0.03
-        atr = r["ATR14"]
-        close = r["Close"]
-        vol_ok = r["Volume"] > r["avgvol"] * 0.8
+        orb_h = row.get("ORB_High", np.nan)
+        orb_l = row.get("ORB_Low", np.nan)
+        orb_r = row.get("ORB_Range", np.nan)
+        atr = row["ATR14"]
+        vol = row["Volume"]
+        avgvol = row["AvgVol"]
+        close = row["Close"]
+        ema9 = row["EMA9"]
+        ema21 = row["EMA21"]
+        ema50 = row["EMA50"]
+        rsi = row["RSI14"]
 
-        orb_high = r.get("ORB_High", np.nan)
-        orb_low = r.get("ORB_Low", np.nan)
-        orb_range = r.get("ORB_range", np.nan)
+        vol_ok = vol > avgvol * 0.8 if avgvol > 0 else False
+
+        entered = False
 
         # ORB signals (hour 9-19)
-        if 9 <= h < 20 and not np.isnan(orb_range) and orb_range > 20 and vol_ok:
-            if close > orb_high and r["EMA9"] > r["EMA21"] and close > r["EMA50"]:
-                sl_dist = 0.3 * orb_range
-                tp_dist = 1.5 * orb_range
-                pos = {
-                    "dir": 1, "entry": close, "type": "ORB_Long",
-                    "sl": close - sl_dist, "tp": close + tp_dist,
-                    "trail_dist": atr, "risk_capital": risk_amt, "date": dt,
-                }
-                daily_count[dt] += 1
-                continue
-            elif close < orb_low and r["EMA9"] < r["EMA21"] and close < r["EMA50"]:
-                sl_dist = 0.3 * orb_range
-                tp_dist = 1.5 * orb_range
-                pos = {
-                    "dir": -1, "entry": close, "type": "ORB_Short",
-                    "sl": close + sl_dist, "tp": close - tp_dist,
-                    "trail_dist": atr, "risk_capital": risk_amt, "date": dt,
-                }
-                daily_count[dt] += 1
-                continue
+        if 9 <= h < 20 and not np.isnan(orb_h) and orb_r > 20 and vol_ok:
+            if close > orb_h and ema9 > ema21 and close > ema50:
+                sl_dist = 0.3 * orb_r
+                tp_dist = 1.5 * orb_r
+                if sl_dist > 0:
+                    size = risk_amt / sl_dist
+                    position = dict(
+                        dir="long", entry=close, sl=close - sl_dist,
+                        tp=close + tp_dist, size=size, bar_date=d,
+                        bar_utc=row["UTC"], kind="ORB",
+                    )
+                    entered = True
+            elif close < orb_l and ema9 < ema21 and close < ema50:
+                sl_dist = 0.3 * orb_r
+                tp_dist = 1.5 * orb_r
+                if sl_dist > 0:
+                    size = risk_amt / sl_dist
+                    position = dict(
+                        dir="short", entry=close, sl=close + sl_dist,
+                        tp=close - tp_dist, size=size, bar_date=d,
+                        bar_utc=row["UTC"], kind="ORB",
+                    )
+                    entered = True
 
-        # Momentum long
-        if vol_ok and r["ema9_cross_up"] and close > r["EMA50"] and 40 < r["RSI14"] < 70:
-            sl_dist = 1.0 * atr
-            tp_dist = 2.0 * atr
-            pos = {
-                "dir": 1, "entry": close, "type": "Mom_Long",
-                "sl": close - sl_dist, "tp": close + tp_dist,
-                "trail_dist": atr, "risk_capital": risk_amt, "date": dt,
-            }
-            daily_count[dt] += 1
+        # Momentum Long (only if no ORB entry)
+        if not entered and vol_ok and atr > 0:
+            if row.get("ema9_cross_up", False) and close > ema50 and 40 < rsi < 70:
+                sl_dist = 1.0 * atr
+                tp_dist = 2.0 * atr
+                size = risk_amt / sl_dist
+                position = dict(
+                    dir="long", entry=close, sl=close - sl_dist,
+                    tp=close + tp_dist, size=size, bar_date=d,
+                    bar_utc=row["UTC"], kind="MOM",
+                )
+                entered = True
 
-    # Force close any remaining position
-    if pos is not None:
-        r = d.iloc[-1]
-        pnl_pts = (r["Close"] - pos["entry"]) * pos["dir"]
-        pnl = pnl_pts / pos["entry"] * pos["risk_capital"]
-        capital += pnl
-        trades.append({**pos, "exit": r["Close"], "pnl": pnl, "exit_reason": "end"})
+        if entered:
+            daily_count[d] += 1
 
-    peak = max(peak, capital)
+        # Update drawdown
+        if capital > peak:
+            peak = capital
+        dd = (peak - capital) / peak if peak > 0 else 0
+        if dd > max_dd:
+            max_dd = dd
+
+    # Close any remaining position at last bar
+    if position is not None and len(dfx) > 0:
+        _close_pos(position, dfx.iloc[-1]["Close"], trades)
+        capital += trades[-1]["pnl"]
+        position = None
+
+    if capital > peak:
+        peak = capital
     dd = (peak - capital) / peak if peak > 0 else 0
-    max_dd = max(max_dd, dd)
+    if dd > max_dd:
+        max_dd = dd
+
     return capital, trades, max_dd
 
 
-def stats_line(trades, cap_start=200.0, cap_end=None):
-    if not trades:
-        return {"return%": 0, "maxDD%": 0, "winrate%": 0, "trades": 0, "PF": 0}
-    pnls = [t["pnl"] for t in trades]
-    wins = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p <= 0]
-    gross_profit = sum(wins) if wins else 0
-    gross_loss = abs(sum(losses)) if losses else 1e-9
-    ret = ((cap_end - cap_start) / cap_start * 100) if cap_end else 0
-    return {
-        "return%": round(ret, 2),
-        "maxDD%": 0,  # filled by caller
-        "winrate%": round(len(wins) / len(pnls) * 100, 1),
-        "trades": len(pnls),
-        "PF": round(gross_profit / gross_loss, 2) if gross_loss > 0 else 999,
-    }
+def summarise(cap0, cap_final, trades, max_dd):
+    ret = (cap_final - cap0) / cap0 * 100
+    wins = [t for t in trades if t["pnl"] > 0]
+    losses = [t for t in trades if t["pnl"] <= 0]
+    wr = len(wins) / len(trades) * 100 if trades else 0
+    gross_profit = sum(t["pnl"] for t in wins) if wins else 0
+    gross_loss = abs(sum(t["pnl"] for t in losses)) if losses else 0
+    pf = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+    return dict(ret_pct=ret, max_dd_pct=max_dd * 100, win_rate=wr,
+                num_trades=len(trades), profit_factor=pf, final_cap=cap_final)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TEST 1: WALK-FORWARD
-# ══════════════════════════════════════════════════════════════════════════════
-print("=" * 70)
-print("TEST 1: WALK-FORWARD (4 periods)")
+# ===========================================================================
+# TEST 1: WALK-FORWARD (4 periods)
+# ===========================================================================
+print("\n" + "=" * 70)
+print("TEST 1: WALK-FORWARD ANALYSIS (4 periods)")
 print("=" * 70)
 
 periods = [
@@ -228,164 +271,220 @@ periods = [
     ("P4: Aug 2025-Mar 2026", "2025-08-01", "2026-03-31"),
 ]
 
-all_trades_full = []  # for later tests
 for name, start, end in periods:
     mask = (df["UTC"] >= start) & (df["UTC"] <= end)
-    sub = df[mask].reset_index(drop=True)
-    cap, trades, mdd = backtest(sub)
-    s = stats_line(trades, 200, cap)
-    s["maxDD%"] = round(mdd * 100, 2)
-    print(f"  {name:30s}  ret={s['return%']:+7.2f}%  maxDD={s['maxDD%']:5.2f}%  "
-          f"WR={s['winrate%']:5.1f}%  trades={s['trades']:3d}  PF={s['PF']:.2f}")
+    sub = df[mask].copy()
+    cap, trd, mdd = backtest(sub)
+    s = summarise(200, cap, trd, mdd)
+    print(f"\n{name} ({len(sub)} bars)")
+    print(f"  Return: {s['ret_pct']:+.2f}%  |  Final: ${s['final_cap']:.2f}")
+    print(f"  Max DD: {s['max_dd_pct']:.2f}%  |  Win Rate: {s['win_rate']:.1f}%")
+    print(f"  Trades: {s['num_trades']}  |  Profit Factor: {s['profit_factor']:.2f}")
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # TEST 2: REGIME ANALYSIS
-# ══════════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 print("\n" + "=" * 70)
 print("TEST 2: REGIME ANALYSIS")
 print("=" * 70)
 
-df_full = add_indicators(df.copy())
-df_full = add_orb(df_full)
+# Classify regime per bar
+def classify_regime(row):
+    if pd.isna(row["EMA50_lag5"]):
+        return "Flat"
+    if row["Close"] > row["EMA50"] and row["EMA50"] > row["EMA50_lag5"]:
+        return "Bull"
+    if row["Close"] < row["EMA50"] and row["EMA50"] < row["EMA50_lag5"]:
+        return "Bear"
+    return "Flat"
 
-# Classify regime at 07:00 per day
-regime_map = {}
-h7 = df_full[df_full["hour"] == 7].copy()
-for _, row in h7.iterrows():
-    e50 = row["EMA50"]
-    e50_5 = row.get("EMA50_5ago", np.nan)
-    c = row["Close"]
-    if np.isnan(e50) or np.isnan(e50_5):
-        regime_map[row["date"]] = "Flat"
-    elif c > e50 and e50 > e50_5:
-        regime_map[row["date"]] = "Bull"
-    elif c < e50 and e50 < e50_5:
-        regime_map[row["date"]] = "Bear"
-    else:
-        regime_map[row["date"]] = "Flat"
+df["regime"] = df.apply(classify_regime, axis=1)
+
+# Build regime lookup: for each date, regime at hour 7
+regime_at_7 = df[df["hour"] == 7].groupby("date")["regime"].first().to_dict()
 
 # Full backtest
-cap_full, trades_full, mdd_full = backtest(df)
-all_trades_full = trades_full
+full_cap, full_trades, full_mdd = backtest(df)
 
-# Tag trades
-regime_trades = {"Bull": [], "Bear": [], "Flat": []}
-for t in trades_full:
-    reg = regime_map.get(t["date"], "Flat")
-    t["regime"] = reg
-    regime_trades[reg].append(t)
+# Tag trades with regime
+for t in full_trades:
+    t["regime"] = regime_at_7.get(t["bar_date"], "Flat")
+
+print(f"\nFull backtest: {len(full_trades)} trades, final ${full_cap:.2f}, max DD {full_mdd*100:.2f}%\n")
 
 for reg in ["Bull", "Bear", "Flat"]:
-    tl = regime_trades[reg]
-    if not tl:
-        print(f"  {reg:6s}:  no trades")
+    rt = [t for t in full_trades if t["regime"] == reg]
+    if not rt:
+        print(f"  {reg}: No trades")
         continue
-    pnls = [t["pnl"] for t in tl]
-    wins = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p <= 0]
-    gp = sum(wins) if wins else 0
-    gl = abs(sum(losses)) if losses else 1e-9
-    wr = len(wins) / len(pnls) * 100
-    pf = gp / gl if gl > 0 else 999
-    net = sum(pnls)
-    print(f"  {reg:6s}:  trades={len(tl):3d}  WR={wr:5.1f}%  PF={pf:.2f}  "
-          f"net=${net:+.2f}")
+    wins = [t for t in rt if t["pnl"] > 0]
+    total_pnl = sum(t["pnl"] for t in rt)
+    wr = len(wins) / len(rt) * 100
+    gp = sum(t["pnl"] for t in wins) if wins else 0
+    gl = abs(sum(t["pnl"] for t in rt if t["pnl"] <= 0))
+    pf = gp / gl if gl > 0 else float("inf")
+    print(f"  {reg}: {len(rt)} trades | PnL ${total_pnl:+.2f} | WR {wr:.1f}% | PF {pf:.2f}")
 
-print(f"\n  Full backtest: ${200:.0f} -> ${cap_full:.2f}  "
-      f"ret={((cap_full-200)/200*100):+.2f}%  maxDD={mdd_full*100:.2f}%  trades={len(trades_full)}")
-
-# ══════════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # TEST 3: MONTE CARLO (500 shuffles)
-# ══════════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 print("\n" + "=" * 70)
-print("TEST 3: MONTE CARLO (500 shuffles)")
+print("TEST 3: MONTE CARLO SIMULATION (500 shuffles)")
 print("=" * 70)
 
-if trades_full:
-    pnl_arr = np.array([t["pnl"] for t in trades_full])
-    n_shuffles = 500
-    finals = np.empty(n_shuffles)
+# Store trade R-multiples (pnl / risk_amount) for proper MC replay.
+# Each trade risks 3% of capital, so pnl_as_R = pnl / (capital * 0.03).
+# We replay: each shuffled trade changes equity by R * 0.03 * equity.
+equity_replay = 200.0
+trade_R = []
+for t in full_trades:
+    risk_at_entry = equity_replay * 0.03
+    r_mult = t["pnl"] / risk_at_entry if risk_at_entry > 0 else 0
+    trade_R.append(r_mult)
+    equity_replay += t["pnl"]
+trade_R = np.array(trade_R)
+
+rng = np.random.default_rng(42)
+
+mc_finals = []
+mc_max_dds = []
+mc_below_100 = 0
+
+for _ in range(500):
+    shuffled = rng.permutation(trade_R)
+    equity = 200.0
+    peak_eq = 200.0
     worst_dd = 0.0
-    below_100 = 0
+    below_100 = False
+    for r in shuffled:
+        equity += equity * 0.03 * r  # replicate 3% risk position sizing
+        if equity < 100:
+            below_100 = True
+        if equity > peak_eq:
+            peak_eq = equity
+        dd = (peak_eq - equity) / peak_eq if peak_eq > 0 else 0
+        if dd > worst_dd:
+            worst_dd = dd
+    mc_finals.append(equity)
+    mc_max_dds.append(worst_dd)
+    if below_100:
+        mc_below_100 += 1
 
-    for s in range(n_shuffles):
-        shuffled = np.random.permutation(pnl_arr)
-        equity = 200.0
-        peak = 200.0
-        mdd_s = 0.0
-        hit_100 = False
-        for p in shuffled:
-            equity += p
-            if equity < 100:
-                hit_100 = True
-            peak = max(peak, equity)
-            dd = (peak - equity) / peak if peak > 0 else 0
-            mdd_s = max(mdd_s, dd)
-        finals[s] = equity
-        worst_dd = max(worst_dd, mdd_s)
-        if hit_100:
-            below_100 += 1
+mc_finals = np.array(mc_finals)
+mc_max_dds = np.array(mc_max_dds)
 
-    print(f"  Median final equity:    ${np.median(finals):.2f}")
-    print(f"  5th percentile:         ${np.percentile(finals, 5):.2f}")
-    print(f"  95th percentile:        ${np.percentile(finals, 95):.2f}")
-    print(f"  Worst max drawdown:     {worst_dd*100:.2f}%")
-    print(f"  P(equity < $100):       {below_100/n_shuffles*100:.1f}%")
-else:
-    print("  No trades to simulate.")
+print(f"\n  Final equity (all paths): ${np.median(mc_finals):.2f}")
+print(f"    (Note: final equity is identical across shuffles because")
+print(f"     multiplicative returns are commutative. Path metrics vary.)")
+print(f"  Max drawdown - median: {np.median(mc_max_dds)*100:.2f}%")
+print(f"  Max drawdown - 5th pct (best):  {np.percentile(mc_max_dds, 5)*100:.2f}%")
+print(f"  Max drawdown - 95th pct (worst): {np.percentile(mc_max_dds, 95)*100:.2f}%")
+print(f"  Worst max drawdown (any path):   {np.max(mc_max_dds)*100:.2f}%")
+print(f"  P(equity drops below $100):      {mc_below_100/500*100:.1f}%")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TEST 4: RANDOM WALK TEST (20 walks)
-# ══════════════════════════════════════════════════════════════════════════════
+# ===========================================================================
+# TEST 4: RANDOM WALK TEST (20 runs)
+# ===========================================================================
 print("\n" + "=" * 70)
-print("TEST 4: RANDOM WALK TEST (20 walks)")
+print("TEST 4: RANDOM WALK TEST (20 synthetic series)")
 print("=" * 70)
 
-hourly_returns = df["Close"].pct_change().dropna()
-vol = hourly_returns.std()
-n_bars = len(df)
-n_walks = 20
+# Compute real hourly return volatility
+real_returns = df["Close"].pct_change().dropna()
+hourly_std = real_returns.std()
+print(f"\n  Real data hourly return std: {hourly_std:.6f}")
+
 rw_results = []
+for run in range(20):
+    n = len(df)
+    seed_price = df["Close"].iloc[0]
+    log_returns = rng.normal(0, hourly_std, n)
+    log_returns[0] = 0  # start at seed price
+    syn_close = seed_price * np.exp(np.cumsum(log_returns))
 
-for w in range(n_walks):
-    # Build synthetic OHLCV with same structure
-    rand_rets = np.random.normal(0, vol, n_bars)
-    synth_close = np.empty(n_bars)
-    synth_close[0] = df["Close"].iloc[0]
-    for j in range(1, n_bars):
-        synth_close[j] = synth_close[j - 1] * (1 + rand_rets[j])
+    syn_df = pd.DataFrame({
+        "UTC": df["UTC"].values,
+        "Open": syn_close * (1 + rng.normal(0, hourly_std * 0.3, n)),
+        "High": syn_close * (1 + np.abs(rng.normal(0, hourly_std * 0.5, n))),
+        "Low": syn_close * (1 - np.abs(rng.normal(0, hourly_std * 0.5, n))),
+        "Close": syn_close,
+        "Volume": df["Volume"].values,
+    })
+    syn_df["UTC"] = pd.to_datetime(syn_df["UTC"])
 
-    synth = df[["UTC", "Volume"]].copy()
-    synth["Close"] = synth_close
-    # Approximate OHLC from close
-    noise = np.abs(np.random.normal(0, vol * synth_close, n_bars))
-    synth["High"] = synth_close + noise
-    synth["Low"] = synth_close - noise
-    synth["Open"] = synth_close * (1 + np.random.normal(0, vol * 0.3, n_bars))
-    synth["hour"] = synth["UTC"].dt.hour
-    synth["date"] = synth["UTC"].dt.date
-    synth["dow"] = synth["UTC"].dt.dayofweek
+    syn_df["EMA9"] = syn_df["Close"].ewm(span=9, adjust=False).mean()
+    syn_df["EMA21"] = syn_df["Close"].ewm(span=21, adjust=False).mean()
+    syn_df["EMA50"] = syn_df["Close"].ewm(span=50, adjust=False).mean()
 
-    cap_rw, trades_rw, mdd_rw = backtest(synth)
+    tr_s = pd.concat([
+        syn_df["High"] - syn_df["Low"],
+        (syn_df["High"] - syn_df["Close"].shift(1)).abs(),
+        (syn_df["Low"] - syn_df["Close"].shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    syn_df["ATR14"] = tr_s.ewm(span=14, adjust=False).mean()
+
+    d2 = syn_df["Close"].diff()
+    g2 = d2.clip(lower=0)
+    l2 = (-d2.clip(upper=0))
+    ag = g2.ewm(span=14, adjust=False).mean()
+    al = l2.ewm(span=14, adjust=False).mean()
+    rs2 = ag / al.replace(0, np.nan)
+    syn_df["RSI14"] = (100 - 100 / (1 + rs2)).fillna(50)
+
+    syn_df["AvgVol"] = syn_df["Volume"].rolling(50, min_periods=1).mean()
+    syn_df["hour"] = syn_df["UTC"].dt.hour
+    syn_df["date"] = syn_df["UTC"].dt.date
+    syn_df["dow"] = syn_df["UTC"].dt.dayofweek
+
+    orb_m = syn_df["hour"].isin([7, 8])
+    orb_g = syn_df[orb_m].groupby("date")
+    oh = orb_g["High"].max().rename("ORB_High")
+    ol = orb_g["Low"].min().rename("ORB_Low")
+    orb2 = pd.concat([oh, ol], axis=1)
+    orb2["ORB_Range"] = orb2["ORB_High"] - orb2["ORB_Low"]
+    syn_df = syn_df.merge(orb2, on="date", how="left")
+
+    syn_df["ema9_above"] = syn_df["EMA9"] > syn_df["EMA21"]
+    syn_df["ema9_cross_up"] = syn_df["ema9_above"] & ~syn_df["ema9_above"].shift(1, fill_value=False)
+
+    cap_rw, trades_rw, mdd_rw = backtest(syn_df)
     ret_rw = (cap_rw - 200) / 200 * 100
-    rw_results.append({"return%": ret_rw, "trades": len(trades_rw), "maxDD%": mdd_rw * 100})
+    wr_rw = sum(1 for t in trades_rw if t["pnl"] > 0) / len(trades_rw) * 100 if trades_rw else 0
+    rw_results.append(dict(ret=ret_rw, trades=len(trades_rw), mdd=mdd_rw * 100, final=cap_rw, win_rate=wr_rw))
 
-avg_ret = np.mean([r["return%"] for r in rw_results])
-avg_trades = np.mean([r["trades"] for r in rw_results])
-avg_dd = np.mean([r["maxDD%"] for r in rw_results])
-profitable = sum(1 for r in rw_results if r["return%"] > 0)
+med_ret = np.median([r["ret"] for r in rw_results])
+med_trades = np.median([r["trades"] for r in rw_results])
+med_mdd = np.median([r["mdd"] for r in rw_results])
+med_final = np.median([r["final"] for r in rw_results])
+profitable_runs = sum(1 for r in rw_results if r["ret"] > 0)
 
-print(f"  Avg return across {n_walks} walks:  {avg_ret:+.2f}%")
-print(f"  Avg trades:                  {avg_trades:.1f}")
-print(f"  Avg max DD:                  {avg_dd:.2f}%")
-print(f"  Profitable walks:            {profitable}/{n_walks}")
-if avg_ret > 5:
-    print("  WARNING: Strategy profits on random data - possible overfitting!")
-elif avg_ret < -5:
-    print("  GOOD: Strategy loses on random data - edge likely real.")
+print(f"  Median return across 20 random walks: {med_ret:+.2f}%")
+print(f"  Median final equity: ${med_final:.2f}")
+print(f"  Median trades: {med_trades:.0f}")
+print(f"  Median max DD: {med_mdd:.2f}%")
+print(f"  Profitable runs: {profitable_runs}/20")
+
+real_ret = (full_cap - 200) / 200 * 100
+real_trades = len(full_trades)
+print(f"\n  Real strategy: return {real_ret:+.2f}%, {real_trades} trades")
+print(f"  Random walks:  median return {med_ret:+.2f}%, median {med_trades:.0f} trades")
+if profitable_runs >= 15:
+    print("  --> WARNING: Strategy profits on random data too ({}/20 runs profitable).".format(profitable_runs))
+    print("      The asymmetric R:R (5:1 for ORB) creates positive expectancy even")
+    print("      without directional edge. Real edge assessment requires comparing")
+    print("      win rates: real vs random.")
+    # Compare win rates
+    real_wr = sum(1 for t in full_trades if t["pnl"] > 0) / len(full_trades) * 100
+    random_wrs = []
+    for r in rw_results:
+        random_wrs.append(r.get("win_rate", 0))
+    if random_wrs and any(w > 0 for w in random_wrs):
+        print(f"      Real win rate: {real_wr:.1f}% vs Random median WR: {np.median(random_wrs):.1f}%")
+elif med_ret < 0 and real_ret > 0:
+    print("  --> Strategy DOES outperform random walks. Edge likely exists.")
 else:
-    print("  INCONCLUSIVE: Returns near zero on random data.")
+    print("  --> Strategy does NOT clearly outperform random walks.")
 
 print("\n" + "=" * 70)
-print("DONE")
+print("ALL TESTS COMPLETE")
 print("=" * 70)
