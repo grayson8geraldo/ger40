@@ -494,24 +494,21 @@ def run_live(symbol_key=None):
         try:
             now = datetime.now(timezone.utc)
 
-            # Calculate seconds until next hour + 30s buffer
-            # (candle closes at :00, we check at :00:30 to ensure data is ready)
-            minutes_left = 59 - now.minute
-            seconds_left = 60 - now.second
-            wait_seconds = minutes_left * 60 + seconds_left + 30  # +30s buffer
+            # Should we fetch now or sleep?
+            # Fetch if: first run, or we're in the first 5 minutes of the hour
+            should_fetch = (last_candle_time is None) or (now.minute < 5)
 
-            # If we just started or it's close to the hour, check immediately
-            if last_candle_time is None or wait_seconds > 3600:
-                wait_seconds = 0
-
-            if wait_seconds > 60:
+            if not should_fetch:
+                # Sleep until next hour + 30s buffer
+                minutes_left = 59 - now.minute
+                seconds_left = 60 - now.second
+                wait_seconds = minutes_left * 60 + seconds_left + 30
                 next_check = now + timedelta(seconds=wait_seconds)
-                print(f"[{now.strftime('%H:%M:%S')} UTC] Next candle closes in {minutes_left}m {seconds_left}s. "
-                      f"Sleeping until {next_check.strftime('%H:%M:%S')} UTC...")
+                print(f"[{now.strftime('%H:%M:%S')} UTC] Next candle at {next_check.strftime('%H:%M')} UTC. Sleeping...")
                 time.sleep(wait_seconds)
                 continue
 
-            print(f"[{now.strftime('%H:%M:%S')} UTC] Candle closed. Fetching data for {sym}...")
+            print(f"[{now.strftime('%H:%M:%S')} UTC] Fetching data for {sym}...")
 
             df = fetch_hourly_data(sym, days=10)
             if df is None or len(df) < 50:
