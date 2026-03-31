@@ -53,7 +53,7 @@ CONFIG = {
         "USA500": {"yahoo": "^GSPC", "name": "S&P 500 (USA500)"},
     },
     "active_symbol": "GER40",
-    "check_interval_seconds": 60,  # Check every minute
+    "check_interval_seconds": 300,  # Check every 5 min (candle closes once/hour, 5 min buffer is enough)
 }
 
 
@@ -484,7 +484,7 @@ def run_live(symbol_key=None):
     print(f"  Symbol: {sym_name}")
     print(f"  Balance: ${state['capital']:.2f}")
     print(f"  Profile: Balanced (8% risk, trail 0.5 ATR)")
-    print(f"  Checking every {CONFIG['check_interval_seconds']}s")
+    print(f"  Mode: Sleeps until next hourly candle close")
     print(f"  Press Ctrl+C to stop")
     print(f"{'='*60}\n")
 
@@ -493,29 +493,45 @@ def run_live(symbol_key=None):
     while True:
         try:
             now = datetime.now(timezone.utc)
-            print(f"[{now.strftime('%H:%M:%S')} UTC] Fetching data for {sym}...")
+
+            # Calculate seconds until next hour + 30s buffer
+            # (candle closes at :00, we check at :00:30 to ensure data is ready)
+            minutes_left = 59 - now.minute
+            seconds_left = 60 - now.second
+            wait_seconds = minutes_left * 60 + seconds_left + 30  # +30s buffer
+
+            # If we just started or it's close to the hour, check immediately
+            if last_candle_time is None or wait_seconds > 3600:
+                wait_seconds = 0
+
+            if wait_seconds > 60:
+                next_check = now + timedelta(seconds=wait_seconds)
+                print(f"[{now.strftime('%H:%M:%S')} UTC] Next candle closes in {minutes_left}m {seconds_left}s. "
+                      f"Sleeping until {next_check.strftime('%H:%M:%S')} UTC...")
+                time.sleep(wait_seconds)
+                continue
+
+            print(f"[{now.strftime('%H:%M:%S')} UTC] Candle closed. Fetching data for {sym}...")
 
             df = fetch_hourly_data(sym, days=10)
             if df is None or len(df) < 50:
-                print("  Not enough data, retrying in 60s...")
-                time.sleep(60)
+                print("  Not enough data, retrying in 5 min...")
+                time.sleep(300)
                 continue
 
             df = add_indicators(df)
             median_price = df["Close"].median()
 
             # Only process CLOSED candles (not the current forming one)
-            # The last row might be the current (unclosed) candle
-            # Use the second-to-last as the latest closed candle
             if len(df) < 2:
-                time.sleep(CONFIG["check_interval_seconds"])
+                time.sleep(300)
                 continue
 
             latest_closed = df.iloc[-2]
             latest_time = str(latest_closed["UTC"])
 
             if latest_time == last_candle_time:
-                # Already processed this candle
+                # Already processed — wait for next hour
                 cur = df.iloc[-1]
                 pos = state["position"]
                 if pos:
@@ -525,13 +541,13 @@ def run_live(symbol_key=None):
                         unrealized = (cur["Close"] - pos["entry_price"]) * pos["lots"]
                     else:
                         unrealized = (pos["entry_price"] - cur["Close"]) * pos["lots"]
-                    print(f"  Waiting... Price: {cur['Close']:.2f} | "
-                          f"{dir_str} {pos['type']} unrealized: ${unrealized:.2f} | "
-                          f"Stop: {pos['stop']:.2f}")
+                    print(f"  Already processed. Price: {cur['Close']:.2f} | "
+                          f"{dir_str} {pos['type']} unrealized: ${unrealized:.2f}")
                 else:
-                    print(f"  Waiting... Price: {cur['Close']:.2f} | No position | "
+                    print(f"  Already processed. Price: {cur['Close']:.2f} | "
                           f"Balance: ${state['capital']:.2f}")
-                time.sleep(CONFIG["check_interval_seconds"])
+                # Wait until next hour
+                time.sleep(300)
                 continue
 
             # New closed candle!
@@ -548,11 +564,12 @@ def run_live(symbol_key=None):
             for action in actions:
                 print(action)
 
+            if not actions:
+                print(f"  No signal. Balance: ${state['capital']:.2f}")
+
             state["last_processed_candle"] = latest_time
             save_state(state)
             save_trades_xlsx(state)
-
-            time.sleep(CONFIG["check_interval_seconds"])
 
         except KeyboardInterrupt:
             print(f"\n\nStopping bot...")
