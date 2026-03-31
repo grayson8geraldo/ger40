@@ -584,8 +584,18 @@ def run_live(symbol_key=None):
                 print(f"  No signal. Balance: ${state['capital']:.2f}")
 
             state["last_processed_candle"] = latest_time
+            last_candle_time = latest_time  # Update loop variable too!
             save_state(state)
             save_trades_xlsx(state)
+
+            # Sleep until next hour (don't loop immediately)
+            now2 = datetime.now(timezone.utc)
+            mins_left = 59 - now2.minute
+            secs_left = 60 - now2.second
+            sleep_secs = mins_left * 60 + secs_left + 30
+            next_check = now2 + timedelta(seconds=sleep_secs)
+            print(f"  Next check at {next_check.strftime('%H:%M:%S')} UTC. Sleeping...\n")
+            time.sleep(sleep_secs)
 
         except KeyboardInterrupt:
             print(f"\n\nStopping bot...")
