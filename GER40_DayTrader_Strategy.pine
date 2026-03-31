@@ -115,11 +115,12 @@ isORBFormation    = utcHour >= orbStartHour and utcHour < orbEndHour
 isORBTrading      = utcHour >= orbEndHour and utcHour < euroClose
 isCloseTime       = utcHour >= euroClose
 
-isDayAllowed = (utcDow == dayofweek.monday    and tradeMon) or
-               (utcDow == dayofweek.tuesday   and tradeTue) or
-               (utcDow == dayofweek.wednesday and tradeWed) or
-               (utcDow == dayofweek.thursday  and tradeThu) or
-               (utcDow == dayofweek.friday    and tradeFri)
+isMon = utcDow == dayofweek.monday    and tradeMon
+isTue = utcDow == dayofweek.tuesday   and tradeTue
+isWed = utcDow == dayofweek.wednesday and tradeWed
+isThu = utcDow == dayofweek.thursday  and tradeThu
+isFri = utcDow == dayofweek.friday    and tradeFri
+isDayAllowed = isMon or isTue or isWed or isThu or isFri
 
 emaFast  = ta.ema(close, emaFastLen)
 emaSlow  = ta.ema(close, emaSlowLen)
@@ -182,26 +183,32 @@ if orbReady and isORBTrading
     prevBelowORB := currentlyBelow
 
 // Signals
-orbLongSignal  = useORB and orbReady and isORBTrading and close > orbHigh and
-                 isBullTrend and orbRange >= orbMinRange and not orbLongTaken and qualityOK
-orbShortSignal = useORB and orbReady and isORBTrading and close < orbLow and
-                 isBearTrend and orbRange >= orbMinRange and not orbShortTaken and qualityOK
+orbLongCond1  = useORB and orbReady and isORBTrading and close > orbHigh
+orbLongCond2  = isBullTrend and orbRange >= orbMinRange and not orbLongTaken and qualityOK
+orbLongSignal = orbLongCond1 and orbLongCond2
 
-failedOrbLong = useFailedORB and orbShortFailed and not orbLongTaken and
-                orbReady and close > orbHigh and isBullTrend and
-                utcHour >= orbEndHour and utcHour < 16 and qualityOK
+orbShortCond1  = useORB and orbReady and isORBTrading and close < orbLow
+orbShortCond2  = isBearTrend and orbRange >= orbMinRange and not orbShortTaken and qualityOK
+orbShortSignal = orbShortCond1 and orbShortCond2
 
-pullbackToORB = not na(close[1]) and close[1] <= orbHigh and close > orbHigh
-secondOrbLong = useSecondORB and orbLongTaken and pullbackToORB and
-                isBullTrend and utcHour >= 10 and utcHour < 16 and orbReady and qualityOK
+failedCond1   = useFailedORB and orbShortFailed and not orbLongTaken
+failedCond2   = orbReady and close > orbHigh and isBullTrend
+failedCond3   = utcHour >= orbEndHour and utcHour < 16 and qualityOK
+failedOrbLong = failedCond1 and failedCond2 and failedCond3
+
+pullbackToORB  = not na(close[1]) and close[1] <= orbHigh and close > orbHigh
+secondCond1    = useSecondORB and orbLongTaken and pullbackToORB
+secondCond2    = isBullTrend and utcHour >= 10 and utcHour < 16 and orbReady and qualityOK
+secondOrbLong  = secondCond1 and secondCond2
 
 // ============================================================================
 // EMA MOMENTUM — Long Only
 // ============================================================================
 
 emaBullCross  = ta.crossover(emaFast, emaSlow)
-momLongSignal = useMomentum and emaBullCross and close > emaTrend and
-                rsi > 40 and rsi < 70 and isEuropeanSession and highVol and qualityOK
+momCond1      = useMomentum and emaBullCross and close > emaTrend
+momCond2      = rsi > 40 and rsi < 70 and isEuropeanSession and highVol and qualityOK
+momLongSignal = momCond1 and momCond2
 
 // ============================================================================
 // DAILY RISK MANAGEMENT
@@ -227,11 +234,12 @@ canTrade = isDayAllowed and not dailyLimitHit and dailyTrades < maxDailyTrades a
 // ENTRY LOGIC
 // ============================================================================
 
-longORB    = canTrade and strategy.position_size == 0 and orbLongSignal and highVol
-longFailed = canTrade and strategy.position_size == 0 and failedOrbLong and highVol and not orbLongSignal
-longSecond = canTrade and strategy.position_size == 0 and secondOrbLong and highVol and not orbLongSignal and not failedOrbLong
-longMom    = canTrade and strategy.position_size == 0 and momLongSignal and not orbLongSignal and not failedOrbLong and not secondOrbLong
-shortSignal = canTrade and strategy.position_size == 0 and orbShortSignal and highVol
+noPosition = canTrade and strategy.position_size == 0
+longORB     = noPosition and orbLongSignal and highVol
+longFailed  = noPosition and failedOrbLong and highVol and not orbLongSignal
+longSecond  = noPosition and secondOrbLong and highVol and not orbLongSignal and not failedOrbLong
+longMom     = noPosition and momLongSignal and not orbLongSignal and not failedOrbLong and not secondOrbLong
+shortSignal = noPosition and orbShortSignal and highVol
 
 var string tradeType = ""
 
