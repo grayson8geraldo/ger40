@@ -124,11 +124,17 @@ class Trade:
         self.pnl = 0
 
 def backtest_daytrader_v5(data, params):
-    """GER40 DayTrader v5.0 backtest."""
+    """GER40 DayTrader v5.0 backtest — adaptive to any index."""
     rp = params.get("risk_pct", 8)
     sl_m = params.get("orb_stop", 0.25)
     tp_m = params.get("orb_target", 1.5)
     tr = params.get("trail", 0.5)
+
+    # Adaptive thresholds based on asset price level
+    median_price = data["Close"].median()
+    orb_min = median_price * 0.001   # ~0.1% of price (GER40~20, USA500~5)
+    atr_max = median_price * 0.007   # ~0.7% of price (GER40~120, USA500~35)
+    min_stop = median_price * 0.0003 # ~0.03% of price (GER40~5, USA500~1.5)
 
     capital = 200.0
     trades = []
@@ -188,7 +194,7 @@ def backtest_daytrader_v5(data, params):
         hv = r["Volume"] > r["AvgVol"] * 0.8 if not pd.isna(r["AvgVol"]) else True
         if not pd.isna(r["RSI"]) and 45 < r["RSI"] < 55:
             continue
-        if not pd.isna(r["ATR14"]) and r["ATR14"] > 120:
+        if not pd.isna(r["ATR14"]) and r["ATR14"] > atr_max:
             continue
 
         bt2 = r["EMA9"] > r["EMA21"] and r["Close"] > r["EMA50"]
@@ -199,19 +205,19 @@ def backtest_daytrader_v5(data, params):
         sig = sl = tp = None
         tt = ""
 
-        if h >= 9 and not pd.isna(orng) and orng > 20:
+        if h >= 9 and not pd.isna(orng) and orng > orb_min:
             if ep > oh and bt2 and hv and not ol_t:
                 sl = ol - orng * sl_m; tp = ep + orng * tp_m; sig = 1; tt = "ORB_L"; ol_t = True
             elif ep < ol and brt and hv and not os_t:
                 sl = oh + orng * sl_m; tp = ep - orng * tp_m; sig = -1; tt = "ORB_S"; os_t = True
 
         if sig is None and osf and not ol_t and h >= 9 and h < 16 and ep > oh and bt2:
-            sl = ol - orng * 0.25; tp = ep + orng * 1.5; sig = 1; tt = "FORB"; ol_t = True; osf = False
+            sl = ol - orng * sl_m; tp = ep + orng * tp_m; sig = 1; tt = "FORB"; ol_t = True; osf = False
 
         if sig is None and ol_t and h >= 10 and h < 16 and bt2:
             prev = data.iloc[i - 1]
             if not pd.isna(prev["Close"]) and prev["Close"] <= oh and ep > oh:
-                sl = ol - orng * 0.25; tp = ep + orng * 1.5; sig = 1; tt = "ORB2"
+                sl = ol - orng * sl_m; tp = ep + orng * tp_m; sig = 1; tt = "ORB2"
 
         if sig is None and r["EMA_Cross"] and ep > r["EMA50"] and not pd.isna(r["RSI"]) and 40 < r["RSI"] < 70 and hv:
             sl = ep - atr * 1.0; tp = ep + atr * 2.0; sig = 1; tt = "MOM"
@@ -220,7 +226,7 @@ def backtest_daytrader_v5(data, params):
             continue
 
         sd = abs(ep - sl)
-        if sd < 5:
+        if sd < min_stop:
             continue
         lots = max(0.01, round(capital * rp / 100 / sd, 3))
         mg = ep * lots / 20
@@ -354,40 +360,41 @@ def walk_forward_test(data, backtest_func, params, n_periods=4):
 # ============================================================================
 
 print("=" * 80)
-print("STRATEGY RANKING SYSTEM v1.0")
+print("STRATEGY RANKING SYSTEM v1.1")
 print("=" * 80)
 
 # Load all assets
 print("\nLoading assets...")
 assets = load_all_assets()
-for asset, data in assets.items():
-    print(f"  {asset}: {len(data)} candles, {data['UTC'].min().strftime('%Y-%m-%d')} to {data['UTC'].max().strftime('%Y-%m-%d')}")
+for asset, adata in assets.items():
+    print(f"  {asset}: {len(adata)} candles, {adata['UTC'].min().strftime('%Y-%m-%d')} to {adata['UTC'].max().strftime('%Y-%m-%d')}")
+    print(f"    Price range: {adata['Close'].min():.0f} - {adata['Close'].max():.0f}")
 
-# Prepare results storage
-all_results = []
+num_assets = len(assets)
+print(f"\nTotal assets: {num_assets}")
 
-# Run each strategy on each asset
+# Phase 1: Run all backtests, collect per-asset results
+print("\nPhase 1: Running backtests on all assets...")
+raw_results = []  # (strat, profile, asset, metrics, wf_results, wf_consistency)
+
 for strat_name, strat_config in STRATEGIES.items():
     print(f"\n{'='*60}")
-    print(f"Strategy: {strat_name}")
-    print(f"Timeframe: {strat_config['timeframe']}")
+    print(f"Strategy: {strat_name} | Timeframe: {strat_config['timeframe']}")
     print(f"{'='*60}")
 
-    bt_func = backtest_daytrader_v5  # map from string in real system
+    bt_func = backtest_daytrader_v5
 
     for profile_name, profile_params in strat_config["profiles"].items():
         print(f"\n  Profile: {profile_name}")
 
         for asset_name, asset_data in assets.items():
             print(f"    Asset: {asset_name}")
-
-            # Add indicators
             data_with_ind = add_indicators(asset_data)
 
             # Full backtest
             cap, trades, dd, meq = bt_func(data_with_ind, profile_params)
             metrics = compute_trade_metrics(cap, trades, dd)
-            print(f"      Full: ${cap:.2f} ({metrics['total_return_pct']:+.1f}%), DD={dd:.1f}%, PF={metrics['profit_factor']:.2f}, WR={metrics['win_rate']:.1f}%")
+            print(f"      Full: ${cap:.2f} ({metrics['total_return_pct']:+.1f}%), DD={dd:.1f}%, PF={metrics['profit_factor']:.2f}, WR={metrics['win_rate']:.1f}%, Trades={metrics['total_trades']}")
 
             # Walk-forward
             wf_results = walk_forward_test(data_with_ind, bt_func, profile_params)
@@ -397,50 +404,75 @@ for strat_name, strat_config in STRATEGIES.items():
             for wf in wf_results:
                 print(f"      {wf['period']}: {wf['return_pct']:+.1f}%, DD={wf['max_dd']:.1f}%, PF={wf['profit_factor']:.2f} {'OK' if wf['profitable'] else 'LOSS'}")
 
-            # Cross-asset score (with 1 asset = 100 if profitable, will improve with more assets)
-            cross_asset_score = 100 if metrics["total_return_pct"] > 0 else 0
+            raw_results.append((strat_name, profile_name, asset_name, metrics, wf_results, wf_consistency))
 
-            # Compute composite score
-            scoring_metrics = {
-                "profit_factor": metrics["profit_factor"],
-                "return_dd_ratio": metrics["return_dd_ratio"],
-                "win_rate": metrics["win_rate"],
-                "wf_consistency": wf_consistency,
-                "cross_asset_score": cross_asset_score,
-            }
-            composite_score = compute_score(scoring_metrics)
-            print(f"      SCORE: {composite_score:.2f}/100")
+# Phase 2: Compute cross-asset scores
+print(f"\nPhase 2: Computing cross-asset consistency scores...")
+all_results = []
 
-            # Store result
-            all_results.append({
-                "Rank": 0,  # will be set after sorting
-                "Strategy": strat_name,
-                "Profile": profile_name,
-                "Timeframe": strat_config["timeframe"],
-                "Asset": asset_name,
-                "Composite_Score": composite_score,
-                "Total_Return_Pct": metrics["total_return_pct"],
-                "Max_Drawdown_Pct": metrics["max_drawdown"],
-                "Profit_Factor": metrics["profit_factor"],
-                "Win_Rate_Pct": metrics["win_rate"],
-                "Return_DD_Ratio": metrics["return_dd_ratio"],
-                "RR_Ratio": metrics["rr_ratio"],
-                "Total_Trades": metrics["total_trades"],
-                "Avg_Win": metrics["avg_win"],
-                "Avg_Loss": metrics["avg_loss"],
-                "WF_Periods_Profitable": f"{wf_profitable}/{wf_total}",
-                "WF_Consistency_Pct": round(wf_consistency, 1),
-                "Cross_Asset_Score": cross_asset_score,
-                "PF_Score_30pct": round(normalize(metrics["profit_factor"], 0.5, 3.0) * 0.30, 2),
-                "RDD_Score_25pct": round(normalize(metrics["return_dd_ratio"], 0, 30) * 0.25, 2),
-                "WR_Score_20pct": round(normalize(metrics["win_rate"], 30, 70) * 0.20, 2),
-                "WF_Score_15pct": round(normalize(wf_consistency, 0, 100) * 0.15, 2),
-                "CA_Score_10pct": round(normalize(cross_asset_score, 0, 100) * 0.10, 2),
-                "Pine_File": strat_config.get("pine_file", ""),
-                "Description": strat_config.get("description", ""),
-                "Backtest_Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "Data_Range": f"{asset_data['UTC'].min().strftime('%Y-%m-%d')} to {asset_data['UTC'].max().strftime('%Y-%m-%d')}",
-            })
+# Group by (strategy, profile) to compute cross-asset score
+from itertools import groupby
+raw_results.sort(key=lambda x: (x[0], x[1]))
+
+for (strat, prof), group in groupby(raw_results, key=lambda x: (x[0], x[1])):
+    group_list = list(group)
+    # Cross-asset score: average profit factor across all assets, penalized for any losing asset
+    n_assets_tested = len(group_list)
+    n_profitable = sum(1 for _, _, _, m, _, _ in group_list if m["total_return_pct"] > 0)
+    avg_pf = np.mean([m["profit_factor"] for _, _, _, m, _, _ in group_list])
+    min_pf = min(m["profit_factor"] for _, _, _, m, _, _ in group_list)
+
+    # Cross-asset score: % profitable assets * min(avg_pf/2, 1) * 100
+    # This rewards strategies that work on ALL assets and penalizes single-asset wonders
+    cross_pct = n_profitable / n_assets_tested
+    cross_asset_score = cross_pct * min(avg_pf / 2, 1) * 100
+
+    for strat_name, profile_name, asset_name, metrics, wf_results, wf_consistency in group_list:
+        scoring_metrics = {
+            "profit_factor": metrics["profit_factor"],
+            "return_dd_ratio": metrics["return_dd_ratio"],
+            "win_rate": metrics["win_rate"],
+            "wf_consistency": wf_consistency,
+            "cross_asset_score": cross_asset_score,
+        }
+        composite_score = compute_score(scoring_metrics)
+
+        wf_profitable = sum(1 for r in wf_results if r["profitable"])
+        wf_total = len(wf_results)
+
+        print(f"  {strat_name}:{profile_name} on {asset_name}: Score={composite_score:.2f}, CA={cross_asset_score:.1f}")
+
+        strat_config = STRATEGIES[strat_name]
+        asset_data_ref = assets[asset_name]
+        all_results.append({
+            "Rank": 0,
+            "Strategy": strat_name,
+            "Profile": profile_name,
+            "Timeframe": strat_config["timeframe"],
+            "Asset": asset_name,
+            "Composite_Score": composite_score,
+            "Total_Return_Pct": metrics["total_return_pct"],
+            "Max_Drawdown_Pct": metrics["max_drawdown"],
+            "Profit_Factor": metrics["profit_factor"],
+            "Win_Rate_Pct": metrics["win_rate"],
+            "Return_DD_Ratio": metrics["return_dd_ratio"],
+            "RR_Ratio": metrics["rr_ratio"],
+            "Total_Trades": metrics["total_trades"],
+            "Avg_Win": metrics["avg_win"],
+            "Avg_Loss": metrics["avg_loss"],
+            "WF_Periods_Profitable": f"{wf_profitable}/{wf_total}",
+            "WF_Consistency_Pct": round(wf_consistency, 1),
+            "Cross_Asset_Score": round(cross_asset_score, 1),
+            "PF_Score_30pct": round(normalize(metrics["profit_factor"], 0.5, 3.0) * 0.30, 2),
+            "RDD_Score_25pct": round(normalize(metrics["return_dd_ratio"], 0, 30) * 0.25, 2),
+            "WR_Score_20pct": round(normalize(metrics["win_rate"], 30, 70) * 0.20, 2),
+            "WF_Score_15pct": round(normalize(wf_consistency, 0, 100) * 0.15, 2),
+            "CA_Score_10pct": round(normalize(cross_asset_score, 0, 100) * 0.10, 2),
+            "Pine_File": strat_config.get("pine_file", ""),
+            "Description": strat_config.get("description", ""),
+            "Backtest_Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "Data_Range": f"{asset_data_ref['UTC'].min().strftime('%Y-%m-%d')} to {asset_data_ref['UTC'].max().strftime('%Y-%m-%d')}",
+        })
 
 # Sort by composite score descending
 all_results.sort(key=lambda x: x["Composite_Score"], reverse=True)
