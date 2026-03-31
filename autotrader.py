@@ -515,12 +515,14 @@ def run_live(symbol_key=None):
 
             df = fetch_hourly_data(sym, days=10)
             if df is None or len(df) < 50:
-                print("  Not enough data, retrying in 5 min...")
+                print("  [!] Data fetch failed or not enough data. Retrying next hour.")
+                last_candle_time = "__retry__"  # Force re-check next hour
                 time.sleep(300)
                 continue
 
             df = add_indicators(df)
             median_price = df["Close"].median()
+            print(f"  Received {len(df)} candles. Median price: {median_price:.0f}")
 
             # Only process CLOSED candles (not the current forming one)
             if len(df) < 2:
@@ -531,8 +533,13 @@ def run_live(symbol_key=None):
             latest_time = str(latest_closed["UTC"])
 
             if latest_time == last_candle_time:
-                # Already processed — wait for next hour
+                # Already processed — show status and wait
                 cur = df.iloc[-1]
+                h = int(cur["Hour"]) if not pd.isna(cur.get("Hour")) else -1
+                trend = "BULL" if cur.get("EMA9",0)>cur.get("EMA21",0) and cur["Close"]>cur.get("EMA50",0) else "BEAR/FLAT"
+                rsi_val = f"{cur['RSI']:.0f}" if not pd.isna(cur.get("RSI")) else "?"
+                atr_val = f"{cur['ATR14']:.1f}" if not pd.isna(cur.get("ATR14")) else "?"
+
                 pos = state["position"]
                 if pos:
                     dir_str = "LONG" if pos["direction"] == 1 else "SHORT"
@@ -541,13 +548,22 @@ def run_live(symbol_key=None):
                         unrealized = (cur["Close"] - pos["entry_price"]) * pos["lots"]
                     else:
                         unrealized = (pos["entry_price"] - cur["Close"]) * pos["lots"]
-                    print(f"  Already processed. Price: {cur['Close']:.2f} | "
-                          f"{dir_str} {pos['type']} unrealized: ${unrealized:.2f}")
+                    emoji = "+" if unrealized >= 0 else ""
+                    print(f"  Price: {cur['Close']:.2f} | {trend} | RSI:{rsi_val} | ATR:{atr_val}")
+                    print(f"  Position: {dir_str} {pos['type']} @ {pos['entry_price']:.2f} | "
+                          f"Unrealized: {emoji}${unrealized:.2f} | Stop: {pos['stop']:.2f}")
                 else:
-                    print(f"  Already processed. Price: {cur['Close']:.2f} | "
-                          f"Balance: ${state['capital']:.2f}")
-                # Wait until next hour
-                time.sleep(300)
+                    print(f"  Price: {cur['Close']:.2f} | {trend} | RSI:{rsi_val} | ATR:{atr_val}")
+                    print(f"  No position | Balance: ${state['capital']:.2f} | "
+                          f"Daily trades: {state['daily_trades']}/{CONFIG['max_daily_trades']}")
+
+                    # Show why no entry (if in trading hours)
+                    if CONFIG["orb_start_hour"] <= h < CONFIG["close_hour"]:
+                        orb_h = cur.get("ORB_High")
+                        orb_l = cur.get("ORB_Low")
+                        if not pd.isna(orb_h):
+                            print(f"  ORB zone: {orb_l:.2f} - {orb_h:.2f} | "
+                                  f"Price {'ABOVE' if cur['Close'] > orb_h else 'BELOW' if cur['Close'] < orb_l else 'INSIDE'} ORB")
                 continue
 
             # New closed candle!
