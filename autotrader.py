@@ -561,6 +561,11 @@ def run_live(symbol_key=None):
                         if not pd.isna(orb_h):
                             print(f"  ORB zone: {orb_l:.2f} - {orb_h:.2f} | "
                                   f"Price {'ABOVE' if cur['Close'] > orb_h else 'BELOW' if cur['Close'] < orb_l else 'INSIDE'} ORB")
+                # Sleep until next hour
+                now2 = datetime.now(timezone.utc)
+                sleep_secs = (59 - now2.minute) * 60 + (60 - now2.second) + 30
+                print(f"  Next candle at {(now2 + timedelta(seconds=sleep_secs)).strftime('%H:%M')} UTC. Sleeping...\n")
+                time.sleep(sleep_secs)
                 continue
 
             # New closed candle!
