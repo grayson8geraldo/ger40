@@ -1,0 +1,337 @@
+//@version=5
+// =============================================================================
+// SMC + Volume Profile Sniper
+// Автоматизированная структура рынка (Lewis Kelly) + ICT/SMC (Faiz) +
+// Fixed Range Volume Profile (ночная сессия NY) + Failed Auction / Breakout
+// =============================================================================
+indicator("SMC + Volume Profile Sniper", shorttitle="SMC+VP Sniper",
+     overlay=true, max_boxes_count=500, max_lines_count=500,
+     max_labels_count=500, max_bars_back=5000)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+grpTF       = "Таймфреймы (иерархия)"
+htfTF       = input.timeframe("240", "HTF (глобальный контекст)",     group=grpTF)
+mtfTF       = input.timeframe("15",  "MTF (определение Bias)",         group=grpTF)
+ltfTF       = input.timeframe("1",   "LTF (вход по FVG/MSS)",          group=grpTF)
+
+grpStruct   = "Структура рынка"
+swingLen    = input.int(5,  "Длина фрактала (Swing)", minval=2, maxval=20, group=grpStruct)
+bodyBreak   = input.bool(true, "Пробой только ТЕЛОМ свечи (фильтр фитилей)", group=grpStruct)
+showStruct  = input.bool(true, "Показывать BOS / CHoCH",                       group=grpStruct)
+
+grpVP       = "Volume Profile (Fixed Range – ночная сессия NY)"
+sessStart   = input.session("1800-0855", "Период расчёта (NY time)", group=grpVP)
+sessTZ      = input.string("America/New_York", "Таймзона", options=["America/New_York","Europe/Moscow","UTC"], group=grpVP)
+rowSize     = input.int(1000, "Row Size (точность бинов)", minval=50, maxval=5000, group=grpVP)
+vaPct       = input.float(70.0, "Value Area %", minval=50, maxval=95, group=grpVP)/100.0
+vpDays      = input.int(5, "Сколько дней строить профиль назад", minval=1, maxval=20, group=grpVP)
+
+grpICT      = "ICT / SMC"
+fvgLookback = input.int(50, "Глубина поиска FVG", minval=5, maxval=300, group=grpICT)
+showFVG     = input.bool(true, "Рисовать FVG",                                  group=grpICT)
+useKZ       = input.bool(true, "Только в Kill Zones (London / NY)",            group=grpICT)
+londonKZ    = input.session("0200-0500", "London KZ (NY time)", group=grpICT)
+nyKZ        = input.session("0830-1100", "NY KZ (NY time)",     group=grpICT)
+
+grpRisk     = "Риск / Цели"
+atrLen      = input.int(14,  "ATR период",    minval=5, maxval=50, group=grpRisk)
+slAtrMult   = input.float(1.2, "SL (× ATR)",  minval=0.3, maxval=5.0, step=0.1, group=grpRisk)
+tp1RR       = input.float(1.5, "TP1 (RR)",    minval=0.5, maxval=10.0, step=0.1, group=grpRisk)
+tp2RR       = input.float(3.0, "TP2 (RR)",    minval=0.5, maxval=10.0, step=0.1, group=grpRisk)
+
+grpUI       = "Отображение"
+colBull     = input.color(color.new(#26a69a, 0),  "Bullish",  group=grpUI)
+colBear     = input.color(color.new(#ef5350, 0),  "Bearish",  group=grpUI)
+colVAH      = input.color(color.new(#ef5350, 20), "VAH",      group=grpUI)
+colVAL      = input.color(color.new(#26a69a, 20), "VAL",      group=grpUI)
+colPOC      = input.color(color.new(#ffb300, 0),  "POC",      group=grpUI)
+colFVGbull  = input.color(color.new(#26a69a, 80), "FVG bull", group=grpUI)
+colFVGbear  = input.color(color.new(#ef5350, 80), "FVG bear", group=grpUI)
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+f_inSess(_s) => not na(time(timeframe.period, _s, sessTZ))
+inKillZone = not useKZ or f_inSess(londonKZ) or f_inSess(nyKZ)
+
+// ---------- Swing / Structure на MTF (с использованием request.security) ----
+f_structure() =>
+    ph = ta.pivothigh(high, swingLen, swingLen)
+    pl = ta.pivotlow(low,  swingLen, swingLen)
+    [ph, pl]
+
+[mtfPH_raw, mtfPL_raw] = request.security(syminfo.tickerid, mtfTF, f_structure(),
+     lookahead=barmerge.lookahead_off)
+
+var float lastSwingH   = na
+var float lastSwingL   = na
+var int   trendBias    = 0      // +1 up, -1 down, 0 flat
+var float prevSwingH   = na
+var float prevSwingL   = na
+
+mtfPH_close = request.security(syminfo.tickerid, mtfTF, close[swingLen], lookahead=barmerge.lookahead_off)
+
+if not na(mtfPH_raw)
+    prevSwingH := lastSwingH
+    lastSwingH := mtfPH_raw
+if not na(mtfPL_raw)
+    prevSwingL := lastSwingL
+    lastSwingL := mtfPL_raw
+
+// Пробой телом (bodyBreak) — проверяем close, иначе high/low
+breakUp   = not na(lastSwingH) and (bodyBreak ? close > lastSwingH : high > lastSwingH)
+breakDown = not na(lastSwingL) and (bodyBreak ? close < lastSwingL : low  < lastSwingL)
+
+var bool bosUp   = false
+var bool bosDn   = false
+var bool chochUp = false
+var bool chochDn = false
+bosUp   := false
+bosDn   := false
+chochUp := false
+chochDn := false
+
+if breakUp
+    if trendBias <= 0
+        chochUp := true
+    else
+        bosUp   := true
+    trendBias := 1
+    lastSwingH := na   // сбросить, чтобы не триггерить повторно
+if breakDown
+    if trendBias >= 0
+        chochDn := true
+    else
+        bosDn   := true
+    trendBias := -1
+    lastSwingL := na
+
+if showStruct
+    if bosUp
+        label.new(bar_index, high, "BOS↑", style=label.style_label_down,
+                  color=colBull, textcolor=color.white, size=size.tiny)
+    if bosDn
+        label.new(bar_index, low, "BOS↓", style=label.style_label_up,
+                  color=colBear, textcolor=color.white, size=size.tiny)
+    if chochUp
+        label.new(bar_index, high, "CHoCH↑", style=label.style_label_down,
+                  color=color.new(colBull, 30), textcolor=color.white, size=size.small)
+    if chochDn
+        label.new(bar_index, low, "CHoCH↓", style=label.style_label_up,
+                  color=color.new(colBear, 30), textcolor=color.white, size=size.small)
+
+// =============================================================================
+// HTF фильтр — направление старшего TF (EMA50 по HTF)
+// =============================================================================
+htfEma = request.security(syminfo.tickerid, htfTF, ta.ema(close, 50),
+     lookahead=barmerge.lookahead_off)
+htfUp  = close > htfEma
+htfDn  = close < htfEma
+
+// =============================================================================
+// VOLUME PROFILE — ночная сессия (Fixed Range)
+// =============================================================================
+inVPSession = f_inSess(sessStart)
+var float sessHi = na
+var float sessLo = na
+var int   sessBars = 0
+
+// Собираем границы сессии
+if inVPSession and not inVPSession[1]
+    sessHi := high
+    sessLo := low
+    sessBars := 0
+if inVPSession
+    sessHi := math.max(nz(sessHi, high), high)
+    sessLo := math.min(nz(sessLo, low),  low)
+    sessBars += 1
+
+// При завершении сессии строим профиль
+var float vah = na
+var float val = na
+var float poc = na
+var line lineVAH = na
+var line lineVAL = na
+var line linePOC = na
+var box  boxVA   = na
+
+f_buildProfile(_hi, _lo, _bars) =>
+    float[] bins = array.new_float(rowSize, 0.0)
+    step = (_hi - _lo) / rowSize
+    if step > 0
+        for i = 0 to _bars - 1
+            h = high[i]
+            l = low[i]
+            v = nz(volume[i], 1)
+            // равномерное распределение объёма бара по перекрываемым бинам
+            iLo = math.max(0, math.floor((l - _lo) / step))
+            iHi = math.min(rowSize - 1, math.floor((h - _lo) / step))
+            span = math.max(1, iHi - iLo + 1)
+            share = v / span
+            for j = iLo to iHi
+                array.set(bins, j, array.get(bins, j) + share)
+    // POC
+    pocIdx = 0
+    pocVal = 0.0
+    for i = 0 to rowSize - 1
+        cur = array.get(bins, i)
+        if cur > pocVal
+            pocVal := cur
+            pocIdx := i
+    totalVol = array.sum(bins)
+    target   = totalVol * vaPct
+    accum    = array.get(bins, pocIdx)
+    lo = pocIdx
+    hi = pocIdx
+    while accum < target and (lo > 0 or hi < rowSize - 1)
+        up   = hi < rowSize - 1 ? array.get(bins, hi + 1) : -1.0
+        down = lo > 0           ? array.get(bins, lo - 1) : -1.0
+        if up >= down
+            hi += 1
+            accum += math.max(up, 0.0)
+        else
+            lo -= 1
+            accum += math.max(down, 0.0)
+    _poc = _lo + (pocIdx + 0.5) * step
+    _vah = _lo + (hi + 1) * step
+    _val = _lo + lo * step
+    [_vah, _val, _poc]
+
+// Сессия только что закончилась → считаем профиль и рисуем
+if (not inVPSession) and inVPSession[1] and sessBars > 3
+    [v_vah, v_val, v_poc] = f_buildProfile(sessHi, sessLo, sessBars)
+    vah := v_vah
+    val := v_val
+    poc := v_poc
+    // нарисовать линии и VA-box на 2 дня вперёд
+    rightX = bar_index + 300
+    if not na(lineVAH)
+        line.delete(lineVAH), line.delete(lineVAL), line.delete(linePOC)
+        box.delete(boxVA)
+    lineVAH := line.new(bar_index, vah, rightX, vah, color=colVAH, width=2, extend=extend.right)
+    lineVAL := line.new(bar_index, val, rightX, val, color=colVAL, width=2, extend=extend.right)
+    linePOC := line.new(bar_index, poc, rightX, poc, color=colPOC, width=1, style=line.style_dashed, extend=extend.right)
+    boxVA   := box.new(bar_index, vah, rightX, val, border_color=color.new(color.gray, 80),
+                        bgcolor=color.new(color.blue, 92), extend=extend.right)
+    label.new(rightX, vah, "VAH",  style=label.style_label_left, color=colVAH, textcolor=color.white, size=size.tiny)
+    label.new(rightX, val, "VAL",  style=label.style_label_left, color=colVAL, textcolor=color.white, size=size.tiny)
+    label.new(rightX, poc, "POC",  style=label.style_label_left, color=colPOC, textcolor=color.black, size=size.tiny)
+
+// =============================================================================
+// FAIR VALUE GAPS (LTF via request.security)
+// =============================================================================
+[ltfH, ltfL, ltfC, ltfO, ltfH2, ltfL2] = request.security(syminfo.tickerid, ltfTF,
+     [high, low, close, open, high[2], low[2]], lookahead=barmerge.lookahead_off)
+
+bullFVG = ltfL > ltfH2   // gap-up: low_0 > high_-2
+bearFVG = ltfH < ltfL2   // gap-down: high_0 < low_-2
+
+if showFVG and bullFVG
+    box.new(bar_index-2, ltfH2, bar_index, ltfL, border_color=na, bgcolor=colFVGbull)
+if showFVG and bearFVG
+    box.new(bar_index-2, ltfL2, bar_index, ltfH, border_color=na, bgcolor=colFVGbear)
+
+// =============================================================================
+// СЕТАПЫ
+// =============================================================================
+aboveVAH = not na(vah) and close > vah
+belowVAL = not na(val) and close < val
+insideVA = not na(vah) and not na(val) and close <= vah and close >= val
+
+// Failed Auction: свеча вышла за VA и вернулась телом внутрь
+failedAuctionShort = not na(vah) and high > vah and close < vah and close > val
+failedAuctionLong  = not na(val) and low  < val and close > val and close < vah
+
+// Breakout (цена закрепилась за VA) + LTF BOS в сторону пробоя
+breakoutAboveVAH = aboveVAH and aboveVAH[1] and aboveVAH[2]
+breakoutBelowVAL = belowVAL and belowVAL[1] and belowVAL[2]
+
+// Ликвидность — sweep (цена пробила last swing фитилём и вернулась) → бонус-фильтр
+sweepHigh = not na(prevSwingH) and high > prevSwingH and close < prevSwingH
+sweepLow  = not na(prevSwingL) and low  < prevSwingL and close > prevSwingL
+
+// ============== BUY SETUP ====================================================
+buyBias      = trendBias > 0 or chochUp or htfUp
+buyFA        = failedAuctionLong and buyBias and bullFVG
+buyBreakout  = breakoutAboveVAH and bullFVG and (bosUp or chochUp)
+buySignal    = (buyFA or buyBreakout) and inKillZone
+
+// ============== SELL SETUP ===================================================
+sellBias     = trendBias < 0 or chochDn or htfDn
+sellFA       = failedAuctionShort and sellBias and bearFVG
+sellBreakout = breakoutBelowVAL and bearFVG and (bosDn or chochDn)
+sellSignal   = (sellFA or sellBreakout) and inKillZone
+
+// =============================================================================
+// РИСК — SL / TP1 / TP2 через ATR
+// =============================================================================
+atr = ta.atr(atrLen)
+
+var float entryPx = na
+var float slPx    = na
+var float tp1Px   = na
+var float tp2Px   = na
+var int   sigDir  = 0     // 1 long, -1 short
+
+if buySignal
+    entryPx := close
+    slPx    := close - atr * slAtrMult
+    tp1Px   := close + atr * slAtrMult * tp1RR
+    tp2Px   := not na(vah) ? math.max(vah, close + atr * slAtrMult * tp2RR) : close + atr * slAtrMult * tp2RR
+    sigDir  := 1
+
+if sellSignal
+    entryPx := close
+    slPx    := close + atr * slAtrMult
+    tp1Px   := close - atr * slAtrMult * tp1RR
+    tp2Px   := not na(val) ? math.min(val, close - atr * slAtrMult * tp2RR) : close - atr * slAtrMult * tp2RR
+    sigDir  := -1
+
+// =============================================================================
+// ВИЗУАЛИЗАЦИЯ СИГНАЛОВ
+// =============================================================================
+plotshape(buySignal,  title="BUY",  style=shape.triangleup,   location=location.belowbar,
+     color=colBull, text="BUY",  textcolor=color.white, size=size.small)
+plotshape(sellSignal, title="SELL", style=shape.triangledown, location=location.abovebar,
+     color=colBear, text="SELL", textcolor=color.white, size=size.small)
+
+bgcolor(buySignal  ? color.new(colBull, 85) : na)
+bgcolor(sellSignal ? color.new(colBear, 85) : na)
+
+// Отображаем уровни последнего сигнала
+plot(sigDir != 0 ? entryPx : na, "Entry", color=color.new(color.white, 0), style=plot.style_linebr, linewidth=1)
+plot(sigDir != 0 ? slPx    : na, "SL",    color=color.new(colBear,   0), style=plot.style_linebr, linewidth=1)
+plot(sigDir != 0 ? tp1Px   : na, "TP1",   color=color.new(colBull,  40), style=plot.style_linebr, linewidth=1)
+plot(sigDir != 0 ? tp2Px   : na, "TP2",   color=color.new(colBull,   0), style=plot.style_linebr, linewidth=2)
+
+// =============================================================================
+// DASHBOARD
+// =============================================================================
+var table tbl = table.new(position.top_right, 2, 7, border_width=1)
+if barstate.islast
+    biasTxt  = trendBias > 0 ? "BULL" : trendBias < 0 ? "BEAR" : "FLAT"
+    biasCol  = trendBias > 0 ? colBull : trendBias < 0 ? colBear : color.gray
+    htfTxt   = htfUp ? "UP" : htfDn ? "DOWN" : "—"
+    zoneTxt  = aboveVAH ? "ABOVE VAH" : belowVAL ? "BELOW VAL" : "INSIDE VA"
+    kzTxt    = inKillZone ? "YES" : "NO"
+    table.cell(tbl, 0, 0, "SMC + VP", bgcolor=color.new(color.blue, 70), text_color=color.white)
+    table.cell(tbl, 1, 0, "Sniper",   bgcolor=color.new(color.blue, 70), text_color=color.white)
+    table.cell(tbl, 0, 1, "HTF "+htfTF),       table.cell(tbl, 1, 1, htfTxt)
+    table.cell(tbl, 0, 2, "MTF bias"),         table.cell(tbl, 1, 2, biasTxt, bgcolor=color.new(biasCol, 70))
+    table.cell(tbl, 0, 3, "VAH"),              table.cell(tbl, 1, 3, na(vah) ? "—" : str.tostring(vah, format.mintick))
+    table.cell(tbl, 0, 4, "POC"),              table.cell(tbl, 1, 4, na(poc) ? "—" : str.tostring(poc, format.mintick))
+    table.cell(tbl, 0, 5, "VAL"),              table.cell(tbl, 1, 5, na(val) ? "—" : str.tostring(val, format.mintick))
+    table.cell(tbl, 0, 6, "Kill Zone"),        table.cell(tbl, 1, 6, kzTxt,
+         bgcolor=inKillZone ? color.new(colBull, 70) : color.new(color.gray, 70))
+
+// =============================================================================
+// ALERTS
+// =============================================================================
+alertcondition(buySignal,  "BUY signal",  "SMC+VP: BUY {{ticker}} @ {{close}}")
+alertcondition(sellSignal, "SELL signal", "SMC+VP: SELL {{ticker}} @ {{close}}")
+alertcondition(bosUp,      "BOS up",      "BOS Up {{ticker}}")
+alertcondition(bosDn,      "BOS down",    "BOS Down {{ticker}}")
+alertcondition(chochUp,    "CHoCH up",    "CHoCH Up {{ticker}}")
+alertcondition(chochDn,    "CHoCH down",  "CHoCH Down {{ticker}}")
