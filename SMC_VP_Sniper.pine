@@ -39,6 +39,14 @@ slAtrMult   = input.float(1.2, "SL (× ATR)",  minval=0.3, maxval=5.0, step=0.1,
 tp1RR       = input.float(1.5, "TP1 (RR)",    minval=0.5, maxval=10.0, step=0.1, group=grpRisk)
 tp2RR       = input.float(3.0, "TP2 (RR)",    minval=0.5, maxval=10.0, step=0.1, group=grpRisk)
 
+grpTH       = "Trend Head (динамический RR)"
+useTH       = input.bool(true, "Включить Trend Head", group=grpTH)
+adxLen      = input.int(14, "ADX период", minval=5, maxval=50, group=grpTH)
+thStrong    = input.int(60, "Сильный тренд (TSS ≥)", minval=40, maxval=90, group=grpTH)
+thWeak      = input.int(35, "Слабый тренд (TSS <) — пропуск", minval=10, maxval=50, group=grpTH)
+tp3RR       = input.float(5.0, "TP3 (RR) — runner", minval=2.0, maxval=15.0, step=0.5, group=grpTH)
+useTrail    = input.bool(true, "Структурный трейлинг (по последнему свингу)", group=grpTH)
+
 grpUI       = "Отображение"
 colBull     = input.color(color.new(#26a69a, 0),  "Bullish",  group=grpUI)
 colBear     = input.color(color.new(#ef5350, 0),  "Bearish",  group=grpUI)
@@ -264,7 +272,43 @@ sellBreakout = breakoutBelowVAL and bearFVG and (bosDn or chochDn)
 sellSignal   = (sellFA or sellBreakout) and inKillZone
 
 // =============================================================================
-// РИСК — SL / TP1 / TP2 через ATR
+// TREND HEAD — оценка силы тренда (TSS, 0..100) для динамического RR
+// =============================================================================
+// Компоненты:
+//  ADX      — сила движения (max 30)
+//  EMA dist — расстояние цены до HTF EMA в ATR (max 25)
+//  EMA slope— наклон HTF EMA по 10 барам (max 15)
+//  Stack    — выравнивание последних структурных событий (max 30)
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+emaDist  = math.abs(close - htfEma) / ta.atr(atrLen)
+emaSlope = (htfEma - htfEma[10]) / ta.atr(atrLen)
+
+var int stackCount = 0
+if bosUp or chochUp
+    stackCount := stackCount > 0 ? stackCount + 1 : 1
+if bosDn or chochDn
+    stackCount := stackCount < 0 ? stackCount - 1 : -1
+
+scoreAdx   = math.min(30.0, adx)                          // 0..30
+scoreDist  = math.min(25.0, emaDist * 12.5)               // 2 ATR → 25
+scoreSlope = math.min(15.0, math.abs(emaSlope) * 30.0)    // 0.5 ATR/10бар → 15
+scoreStack = math.min(30.0, math.abs(stackCount) * 10.0)  // 3 события → 30
+tss        = scoreAdx + scoreDist + scoreSlope + scoreStack
+
+// направление тренда по DMI согласовано с сигналом?
+trendDirOk(dir) =>
+    dir > 0 ? (diPlus > diMinus and emaSlope > 0) : (diMinus > diPlus and emaSlope < 0)
+
+// фильтр: TSS < thWeak → пропустить вход (флэт, сигнал отменяется)
+buySignal  := buySignal  and (not useTH or tss >= thWeak)
+sellSignal := sellSignal and (not useTH or tss >= thWeak)
+
+// флаг "runner": сильный тренд + DMI согласован
+runnerLong  = useTH and tss >= thStrong and trendDirOk(1)
+runnerShort = useTH and tss >= thStrong and trendDirOk(-1)
+
+// =============================================================================
+// РИСК — SL / TP1 / TP2 / TP3 через ATR + структурный трейлинг
 // =============================================================================
 atr = ta.atr(atrLen)
 
@@ -272,21 +316,33 @@ var float entryPx = na
 var float slPx    = na
 var float tp1Px   = na
 var float tp2Px   = na
-var int   sigDir  = 0     // 1 long, -1 short
+var float tp3Px   = na
+var int   sigDir  = 0      // 1 long, -1 short
+var bool  runner  = false  // runner-режим текущей сделки
 
 if buySignal
     entryPx := close
     slPx    := close - atr * slAtrMult
     tp1Px   := close + atr * slAtrMult * tp1RR
     tp2Px   := not na(vah) ? math.max(vah, close + atr * slAtrMult * tp2RR) : close + atr * slAtrMult * tp2RR
+    tp3Px   := runnerLong  ? close + atr * slAtrMult * tp3RR : na
     sigDir  := 1
+    runner  := runnerLong
 
 if sellSignal
     entryPx := close
     slPx    := close + atr * slAtrMult
     tp1Px   := close - atr * slAtrMult * tp1RR
     tp2Px   := not na(val) ? math.min(val, close - atr * slAtrMult * tp2RR) : close - atr * slAtrMult * tp2RR
+    tp3Px   := runnerShort ? close - atr * slAtrMult * tp3RR : na
     sigDir  := -1
+    runner  := runnerShort
+
+// Структурный трейлинг — двигаем SL за последним подтверждённым свингом
+if useTrail and sigDir == 1 and runner and not na(prevSwingL)
+    slPx := math.max(slPx, prevSwingL)
+if useTrail and sigDir == -1 and runner and not na(prevSwingH)
+    slPx := math.min(slPx, prevSwingH)
 
 // =============================================================================
 // ВИЗУАЛИЗАЦИЯ СИГНАЛОВ
@@ -304,17 +360,21 @@ plot(sigDir != 0 ? entryPx : na, "Entry", color=color.new(color.white, 0), style
 plot(sigDir != 0 ? slPx    : na, "SL",    color=color.new(colBear,   0), style=plot.style_linebr, linewidth=1)
 plot(sigDir != 0 ? tp1Px   : na, "TP1",   color=color.new(colBull,  40), style=plot.style_linebr, linewidth=1)
 plot(sigDir != 0 ? tp2Px   : na, "TP2",   color=color.new(colBull,   0), style=plot.style_linebr, linewidth=2)
+plot(sigDir != 0 and runner ? tp3Px : na, "TP3 (runner)", color=color.new(#ffeb3b, 0), style=plot.style_linebr, linewidth=2)
 
 // =============================================================================
 // DASHBOARD
 // =============================================================================
-var table tbl = table.new(position.top_right, 2, 7, border_width=1)
+var table tbl = table.new(position.top_right, 2, 9, border_width=1)
 if barstate.islast
     biasTxt  = trendBias > 0 ? "BULL" : trendBias < 0 ? "BEAR" : "FLAT"
     biasCol  = trendBias > 0 ? colBull : trendBias < 0 ? colBear : color.gray
     htfTxt   = htfUp ? "UP" : htfDn ? "DOWN" : "—"
     zoneTxt  = aboveVAH ? "ABOVE VAH" : belowVAL ? "BELOW VAL" : "INSIDE VA"
     kzTxt    = inKillZone ? "YES" : "NO"
+    tssTxt   = str.tostring(tss, "#.0")
+    tssCol   = tss >= thStrong ? colBull : tss >= thWeak ? color.new(color.orange, 30) : color.new(color.gray, 50)
+    thMode   = tss >= thStrong ? "RUNNER" : tss >= thWeak ? "NORMAL" : "SKIP"
     table.cell(tbl, 0, 0, "SMC + VP", bgcolor=color.new(color.blue, 70), text_color=color.white)
     table.cell(tbl, 1, 0, "Sniper",   bgcolor=color.new(color.blue, 70), text_color=color.white)
     table.cell(tbl, 0, 1, "HTF "+htfTF)
@@ -329,6 +389,10 @@ if barstate.islast
     table.cell(tbl, 1, 5, na(val) ? "—" : str.tostring(val, format.mintick))
     table.cell(tbl, 0, 6, "Kill Zone")
     table.cell(tbl, 1, 6, kzTxt, bgcolor=inKillZone ? color.new(colBull, 70) : color.new(color.gray, 70))
+    table.cell(tbl, 0, 7, "Trend TSS")
+    table.cell(tbl, 1, 7, tssTxt, bgcolor=tssCol, text_color=color.white)
+    table.cell(tbl, 0, 8, "TH режим")
+    table.cell(tbl, 1, 8, thMode, bgcolor=tssCol, text_color=color.white)
 
 // =============================================================================
 // ALERTS
