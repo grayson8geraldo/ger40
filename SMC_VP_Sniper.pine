@@ -1,12 +1,10 @@
-//@version=5
+//@version=6
 // =============================================================================
 // SMC + Volume Profile Sniper
 // Автоматизированная структура рынка (Lewis Kelly) + ICT/SMC (Faiz) +
 // Fixed Range Volume Profile (ночная сессия NY) + Failed Auction / Breakout
 // =============================================================================
-indicator("SMC + Volume Profile Sniper", shorttitle="SMC+VP Sniper",
-     overlay=true, max_boxes_count=500, max_lines_count=500,
-     max_labels_count=500, max_bars_back=5000)
+indicator("SMC + Volume Profile Sniper", shorttitle="SMC+VP", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500, max_bars_back=5000)
 
 // =============================================================================
 // INPUTS
@@ -208,13 +206,14 @@ if (not inVPSession) and inVPSession[1] and sessBars > 3
     // нарисовать линии и VA-box на 2 дня вперёд
     rightX = bar_index + 300
     if not na(lineVAH)
-        line.delete(lineVAH), line.delete(lineVAL), line.delete(linePOC)
+        line.delete(lineVAH)
+        line.delete(lineVAL)
+        line.delete(linePOC)
         box.delete(boxVA)
     lineVAH := line.new(bar_index, vah, rightX, vah, color=colVAH, width=2, extend=extend.right)
     lineVAL := line.new(bar_index, val, rightX, val, color=colVAL, width=2, extend=extend.right)
     linePOC := line.new(bar_index, poc, rightX, poc, color=colPOC, width=1, style=line.style_dashed, extend=extend.right)
-    boxVA   := box.new(bar_index, vah, rightX, val, border_color=color.new(color.gray, 80),
-                        bgcolor=color.new(color.blue, 92), extend=extend.right)
+    boxVA   := box.new(bar_index, vah, rightX, val, border_color=color.new(color.gray, 80), bgcolor=color.new(color.blue, 92), extend=extend.right)
     label.new(rightX, vah, "VAH",  style=label.style_label_left, color=colVAH, textcolor=color.white, size=size.tiny)
     label.new(rightX, val, "VAL",  style=label.style_label_left, color=colVAL, textcolor=color.white, size=size.tiny)
     label.new(rightX, poc, "POC",  style=label.style_label_left, color=colPOC, textcolor=color.black, size=size.tiny)
@@ -318,13 +317,18 @@ if barstate.islast
     kzTxt    = inKillZone ? "YES" : "NO"
     table.cell(tbl, 0, 0, "SMC + VP", bgcolor=color.new(color.blue, 70), text_color=color.white)
     table.cell(tbl, 1, 0, "Sniper",   bgcolor=color.new(color.blue, 70), text_color=color.white)
-    table.cell(tbl, 0, 1, "HTF "+htfTF),       table.cell(tbl, 1, 1, htfTxt)
-    table.cell(tbl, 0, 2, "MTF bias"),         table.cell(tbl, 1, 2, biasTxt, bgcolor=color.new(biasCol, 70))
-    table.cell(tbl, 0, 3, "VAH"),              table.cell(tbl, 1, 3, na(vah) ? "—" : str.tostring(vah, format.mintick))
-    table.cell(tbl, 0, 4, "POC"),              table.cell(tbl, 1, 4, na(poc) ? "—" : str.tostring(poc, format.mintick))
-    table.cell(tbl, 0, 5, "VAL"),              table.cell(tbl, 1, 5, na(val) ? "—" : str.tostring(val, format.mintick))
-    table.cell(tbl, 0, 6, "Kill Zone"),        table.cell(tbl, 1, 6, kzTxt,
-         bgcolor=inKillZone ? color.new(colBull, 70) : color.new(color.gray, 70))
+    table.cell(tbl, 0, 1, "HTF "+htfTF)
+    table.cell(tbl, 1, 1, htfTxt)
+    table.cell(tbl, 0, 2, "MTF bias")
+    table.cell(tbl, 1, 2, biasTxt, bgcolor=color.new(biasCol, 70))
+    table.cell(tbl, 0, 3, "VAH")
+    table.cell(tbl, 1, 3, na(vah) ? "—" : str.tostring(vah, format.mintick))
+    table.cell(tbl, 0, 4, "POC")
+    table.cell(tbl, 1, 4, na(poc) ? "—" : str.tostring(poc, format.mintick))
+    table.cell(tbl, 0, 5, "VAL")
+    table.cell(tbl, 1, 5, na(val) ? "—" : str.tostring(val, format.mintick))
+    table.cell(tbl, 0, 6, "Kill Zone")
+    table.cell(tbl, 1, 6, kzTxt, bgcolor=inKillZone ? color.new(colBull, 70) : color.new(color.gray, 70))
 
 // =============================================================================
 // ALERTS
